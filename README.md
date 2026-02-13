@@ -1,10 +1,6 @@
 # rubric-gates
 
-Rubric-based quality gates for AI-generated code. Built for IT teams managing Claude Code skill ecosystems where business users generate tools that need quality control without blocking productivity.
-
-## Problem
-
-Technical-adjacent business users (data analysts, PMs) use AI coding tools to build personal productivity tools — replacing what used to be Excel spreadsheets. These tools grow in importance without visibility, quality control, or ownership, creating shadow IT risk.
+Rubric-based quality gates for AI-generated code. Built for IT teams managing Claude Code skill ecosystems that need quality control without blocking productivity.
 
 ## Projects
 
