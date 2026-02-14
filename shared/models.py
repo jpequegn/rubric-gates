@@ -100,6 +100,20 @@ class GateResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class OverrideRecord(BaseModel):
+    """Audit record for a gate override."""
+
+    id: str = ""
+    timestamp: datetime = Field(default_factory=datetime.now)
+    user: str
+    filename: str = ""
+    gate_result: GateResult
+    justification: str = ""
+    override_type: str = "proceed"  # "proceed" | "escalate"
+    reviewed_by: str = ""
+    review_outcome: str = "pending"  # "approved" | "rejected" | "pending"
+
+
 # --- Registry Models ---
 
 
