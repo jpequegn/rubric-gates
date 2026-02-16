@@ -71,6 +71,7 @@ class ScoreResult(BaseModel):
     files_touched: list[str] = Field(default_factory=list)
     dimension_scores: list[DimensionScore] = Field(default_factory=list)
     composite_score: float = Field(ge=0.0, le=1.0, default=0.0)
+    source_code: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -69,13 +69,14 @@ class ScorecardDataset:
         for result in results:
             dim_scores = {ds.dimension.value: ds.score for ds in result.dimension_scores}
             example = TrainingExample(
-                code="",  # Code not stored in ScoreResult
+                code=result.source_code or "",
                 composite_score=result.composite_score,
                 dimension_scores=dim_scores,
                 metadata={
                     "user": result.user,
                     "timestamp": result.timestamp.isoformat(),
                     "skill_used": result.skill_used,
+                    "has_source_code": result.source_code is not None,
                 },
             )
             examples.append(example)

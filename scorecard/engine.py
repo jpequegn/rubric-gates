@@ -134,6 +134,7 @@ class RubricEngine:
             files_touched=[filename] if filename else [],
             dimension_scores=dimension_scores,
             composite_score=composite,
+            source_code=code if code else None,
             metadata=result_metadata,
         )
 
