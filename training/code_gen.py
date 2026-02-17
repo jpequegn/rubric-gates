@@ -7,8 +7,11 @@ that inherently passes quality gates.
 
 from __future__ import annotations
 
+import json
+import math
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from shared.models import GateTier
@@ -27,6 +30,9 @@ class GRPOConfig:
     diversity_penalty: float = 0.05
     red_tier_multiplier: float = 0.5
     green_tier_bonus: float = 1.2
+    gradient_clip_max_norm: float = 1.0
+    lr_scheduler: str = "cosine"  # "cosine" | "linear" | "constant"
+    save_every_epoch: bool = True
     seed: int = 42
 
 
@@ -50,6 +56,8 @@ class GRPOTrainingResult:
     final_mean_reward: float = 0.0
     final_kl_divergence: float = 0.0
     reward_history: list[float] = field(default_factory=list)
+    kl_history: list[float] = field(default_factory=list)
+    loss_history: list[float] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -121,6 +129,13 @@ class CodeGenTrainer(RubricTrainer):
         self.rubric_engine = rubric_engine
         self.gate_evaluator = gate_evaluator
         self._prompts: list[str] = []
+        self._ref_model: Any = None
+        self._optimizer: Any = None
+        self._scheduler: Any = None
+        self._global_step: int = 0
+        self._accumulated_loss: float = 0.0
+        self._accumulated_kl: float = 0.0
+        self._step_count: int = 0
 
     def prepare_prompts(
         self,
@@ -255,6 +270,8 @@ class CodeGenTrainer(RubricTrainer):
 
         for epoch in range(self.config.num_epochs):
             epoch_rewards: list[float] = []
+            epoch_losses: list[float] = []
+            epoch_kls: list[float] = []
             shuffled = list(self._prompts)
             rng.shuffle(shuffled)
 
@@ -273,19 +290,42 @@ class CodeGenTrainer(RubricTrainer):
 
                 # Update model (if loaded)
                 if self.model is not None:
-                    self._update_step(prompt, completions, advantages)
+                    step_metrics = self._update_step(prompt, completions, advantages)
+                    epoch_losses.append(step_metrics.get("loss", 0.0))
+                    epoch_kls.append(step_metrics.get("kl_divergence", 0.0))
 
                 epoch_rewards.extend(rewards)
 
             mean_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0
+            mean_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+            mean_kl = sum(epoch_kls) / len(epoch_kls) if epoch_kls else 0.0
+
             result.reward_history.append(round(mean_reward, 4))
+            result.loss_history.append(round(mean_loss, 4))
+            result.kl_history.append(round(mean_kl, 4))
             result.final_mean_reward = round(mean_reward, 4)
+            result.final_kl_divergence = round(mean_kl, 4)
+
+            # Checkpoint after each epoch
+            if self.grpo_config.save_every_epoch and self.model is not None:
+                epoch_path = str(Path(self.config.output_dir) / f"checkpoint-epoch-{epoch}")
+                self.save_checkpoint(
+                    path=epoch_path,
+                    metadata={
+                        "epoch": epoch,
+                        "mean_reward": mean_reward,
+                        "mean_loss": mean_loss,
+                        "mean_kl": mean_kl,
+                        "global_step": self._global_step,
+                    },
+                )
 
         result.epochs_completed = self.config.num_epochs
         result.metrics = {
             "num_prompts": len(self._prompts),
             "group_size": self.grpo_config.group_size,
             "total_completions": len(self._prompts) * self.grpo_config.group_size,
+            "global_steps": self._global_step,
         }
 
         return result
@@ -401,14 +441,234 @@ class CodeGenTrainer(RubricTrainer):
             completions.append(text[len(prompt) :])  # Strip prompt prefix
         return completions
 
+    def setup_training(self) -> None:
+        """Initialize optimizer, scheduler, and reference model for GRPO.
+
+        Must be called after load_model(). Creates a frozen reference copy
+        for KL divergence computation, sets up AdamW optimizer, and
+        configures learning rate scheduling.
+
+        Raises:
+            RuntimeError: If no model loaded.
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load_model() first.")
+
+        import copy
+
+        import torch
+
+        # Freeze reference model (for KL penalty)
+        self._ref_model = copy.deepcopy(self.model)
+        self._ref_model.eval()
+        for param in self._ref_model.parameters():
+            param.requires_grad = False
+
+        # Set up optimizer — only train parameters that require grad
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self._optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.config.learning_rate,
+            weight_decay=0.01,
+        )
+
+        # Learning rate scheduler
+        total_steps = (
+            len(self._prompts) * self.config.num_epochs // self.config.gradient_accumulation_steps
+        )
+        total_steps = max(total_steps, 1)
+        self._scheduler = _create_scheduler(
+            self._optimizer,
+            self.grpo_config.lr_scheduler,
+            total_steps,
+            self.config.warmup_ratio,
+        )
+
+        self._global_step = 0
+        self._accumulated_loss = 0.0
+        self._accumulated_kl = 0.0
+        self._step_count = 0
+
     def _update_step(
         self,
         prompt: str,
         completions: list[str],
         advantages: list[float],
-    ) -> None:
-        """Perform a single GRPO update step (placeholder for real training)."""
-        pass
+    ) -> dict[str, float]:
+        """Perform a single GRPO update step.
+
+        Computes policy gradient loss weighted by advantages, adds KL
+        divergence penalty against the reference model, accumulates
+        gradients, and steps the optimizer when the accumulation window
+        is full.
+
+        Args:
+            prompt: The input prompt.
+            completions: Generated completions for this prompt.
+            advantages: Normalized advantage values per completion.
+
+        Returns:
+            Dict with step metrics (loss, kl_divergence).
+        """
+        import torch
+
+        if self._optimizer is None:
+            self.setup_training()
+
+        self.model.train()
+        device = next(self.model.parameters()).device
+
+        total_loss = torch.tensor(0.0, device=device)
+        total_kl = torch.tensor(0.0, device=device)
+        valid_count = 0
+
+        for completion, advantage in zip(completions, advantages):
+            if abs(advantage) < 1e-8:
+                continue
+
+            text = prompt + completion
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.config.max_seq_length,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Forward pass through policy model
+            outputs = self.model(**inputs, labels=inputs["input_ids"])
+            log_probs = -outputs.loss  # avg negative log-likelihood
+
+            # Forward pass through reference model (no grad)
+            with torch.no_grad():
+                ref_outputs = self._ref_model(**inputs, labels=inputs["input_ids"])
+                ref_log_probs = -ref_outputs.loss
+
+            # KL divergence: E[log(pi/pi_ref)] = log_probs - ref_log_probs
+            kl = log_probs - ref_log_probs
+
+            # GRPO policy gradient: -advantage * log_probs + kl_penalty * kl
+            step_loss = -advantage * log_probs + self.grpo_config.kl_penalty * kl
+
+            total_loss = total_loss + step_loss
+            total_kl = total_kl + kl.detach().abs()
+            valid_count += 1
+
+        if valid_count == 0:
+            return {"loss": 0.0, "kl_divergence": 0.0}
+
+        # Average over group
+        avg_loss = total_loss / valid_count
+        avg_kl = (total_kl / valid_count).item()
+
+        # Scale for gradient accumulation
+        scaled_loss = avg_loss / self.config.gradient_accumulation_steps
+        scaled_loss.backward()
+
+        self._accumulated_loss += avg_loss.item()
+        self._accumulated_kl += avg_kl
+        self._step_count += 1
+
+        # Step optimizer when accumulation window is full
+        if self._step_count >= self.config.gradient_accumulation_steps:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.grpo_config.gradient_clip_max_norm,
+            )
+
+            self._optimizer.step()
+            if self._scheduler is not None:
+                self._scheduler.step()
+            self._optimizer.zero_grad()
+
+            self._global_step += 1
+            avg_step_loss = self._accumulated_loss / self._step_count
+            avg_step_kl = self._accumulated_kl / self._step_count
+
+            self._accumulated_loss = 0.0
+            self._accumulated_kl = 0.0
+            self._step_count = 0
+
+            return {"loss": avg_step_loss, "kl_divergence": avg_step_kl}
+
+        return {"loss": avg_loss.item(), "kl_divergence": avg_kl}
+
+    def save_training_state(self, path: str) -> Path:
+        """Save full training state for resumption.
+
+        Saves model, optimizer, scheduler, and training progress.
+
+        Args:
+            path: Directory to save state to.
+
+        Returns:
+            Path to the saved state directory.
+        """
+        import torch
+
+        state_path = Path(path)
+        state_path.mkdir(parents=True, exist_ok=True)
+
+        # Save model checkpoint
+        self.save_checkpoint(path=path)
+
+        # Save optimizer and scheduler state
+        training_state = {
+            "global_step": self._global_step,
+            "optimizer_state_dict": (self._optimizer.state_dict() if self._optimizer else None),
+            "scheduler_state_dict": (self._scheduler.state_dict() if self._scheduler else None),
+            "grpo_config": {
+                "group_size": self.grpo_config.group_size,
+                "kl_penalty": self.grpo_config.kl_penalty,
+                "gradient_clip_max_norm": self.grpo_config.gradient_clip_max_norm,
+                "lr_scheduler": self.grpo_config.lr_scheduler,
+            },
+        }
+        torch.save(training_state, state_path / "training_state.pt")
+
+        # Save prompts
+        if self._prompts:
+            (state_path / "prompts.json").write_text(json.dumps(self._prompts))
+
+        return state_path
+
+    def load_training_state(self, path: str) -> None:
+        """Resume training from a saved state.
+
+        Loads model, optimizer, scheduler, and training progress.
+
+        Args:
+            path: Directory containing the saved state.
+
+        Raises:
+            FileNotFoundError: If state files not found.
+        """
+        import torch
+
+        state_path = Path(path)
+        if not state_path.exists():
+            raise FileNotFoundError(f"Training state not found: {path}")
+
+        # Load model checkpoint
+        self.load_checkpoint(path)
+
+        # Set up training (creates optimizer, scheduler, ref model)
+        prompts_file = state_path / "prompts.json"
+        if prompts_file.exists():
+            self._prompts = json.loads(prompts_file.read_text())
+
+        self.setup_training()
+
+        # Restore optimizer/scheduler state
+        state_file = state_path / "training_state.pt"
+        if state_file.exists():
+            training_state = torch.load(state_file, weights_only=False)
+            self._global_step = training_state.get("global_step", 0)
+            if training_state.get("optimizer_state_dict") and self._optimizer:
+                self._optimizer.load_state_dict(training_state["optimizer_state_dict"])
+            if training_state.get("scheduler_state_dict") and self._scheduler:
+                self._scheduler.load_state_dict(training_state["scheduler_state_dict"])
 
 
 # --- Helper functions ---
@@ -472,6 +732,51 @@ def _group_similarity(completion: str, others: list[str]) -> float:
         similarities.append(overlap)
 
     return sum(similarities) / len(similarities) if similarities else 0.0
+
+
+def _create_scheduler(
+    optimizer: Any,
+    scheduler_type: str,
+    total_steps: int,
+    warmup_ratio: float,
+) -> Any:
+    """Create a learning rate scheduler.
+
+    Args:
+        optimizer: The optimizer to schedule.
+        scheduler_type: One of "cosine", "linear", "constant".
+        total_steps: Total number of optimizer steps.
+        warmup_ratio: Fraction of steps for warmup.
+
+    Returns:
+        A PyTorch LR scheduler.
+    """
+    import torch
+
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    if scheduler_type == "constant":
+        return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+
+    if scheduler_type == "linear":
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return max(1e-8, step / max(warmup_steps, 1))
+            remaining = max(total_steps - step, 0)
+            total_decay = max(total_steps - warmup_steps, 1)
+            return max(0.0, remaining / total_decay)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Default: cosine
+    def cosine_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return max(1e-8, step / max(warmup_steps, 1))
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_lambda)
 
 
 def _synthetic_completion(rng: random.Random) -> str:
