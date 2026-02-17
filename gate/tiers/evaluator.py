@@ -6,6 +6,7 @@ Tier logic:
   RED if:
     - ANY critical pattern detected
     - Security dimension score < red threshold (default 0.3)
+    - Any dimension below its per-dimension red threshold (if set via profile)
 
   YELLOW if:
     - Composite score between yellow and green thresholds
@@ -41,6 +42,7 @@ class TierEvaluator:
 
     Args:
         config: Gate configuration with thresholds.
+        profile: Profile name to use (overrides config.active_profile).
         dimension_yellow_thresholds: Per-dimension yellow thresholds.
             Defaults to sensible values if not provided.
     """
@@ -48,13 +50,22 @@ class TierEvaluator:
     def __init__(
         self,
         config: GateConfig | None = None,
+        profile: str = "",
         dimension_yellow_thresholds: dict[str, float] | None = None,
     ) -> None:
         if config is None:
             config = load_config().gate
         self.config = config
-        self.dim_yellow = dimension_yellow_thresholds or _DEFAULT_DIM_YELLOW
+        self._profile = config.get_profile(profile)
+        self.dim_yellow = dimension_yellow_thresholds or dict(_DEFAULT_DIM_YELLOW)
+        self._apply_profile_dimensions()
         self.detectors = get_configured_detectors(config.patterns)
+
+    def _apply_profile_dimensions(self) -> None:
+        """Apply per-dimension overrides from the active profile."""
+        for dim_name, override in self._profile.dimensions.items():
+            if override.yellow is not None:
+                self.dim_yellow[dim_name] = override.yellow
 
     def evaluate(
         self,
@@ -104,13 +115,25 @@ class TierEvaluator:
         # Security dimension below red threshold → RED
         security_score = self._get_dimension_score(score_result, Dimension.SECURITY.value)
         if security_score is not None:
-            if security_score < self.config.thresholds.red.security:
+            if security_score < self._profile.red_security:
                 tier = GateTier.RED
                 blocked = True
                 advisories.append(
                     f"BLOCKED: Security score {security_score:.2f} is below "
-                    f"red threshold {self.config.thresholds.red.security:.2f}."
+                    f"red threshold {self._profile.red_security:.2f}."
                 )
+
+        # Per-dimension red thresholds from profile
+        for ds in score_result.dimension_scores:
+            dim_override = self._profile.dimensions.get(ds.dimension.value)
+            if dim_override and dim_override.red is not None:
+                if ds.score < dim_override.red:
+                    tier = GateTier.RED
+                    blocked = True
+                    advisories.append(
+                        f"BLOCKED: Dimension '{ds.dimension.value}' scored {ds.score:.2f}, "
+                        f"below red threshold {dim_override.red:.2f}."
+                    )
 
         # If already RED, skip yellow/green checks
         if tier == GateTier.RED:
@@ -127,8 +150,8 @@ class TierEvaluator:
 
         # Composite score between yellow and green thresholds
         composite = score_result.composite_score
-        green_min = self.config.thresholds.green.min_composite
-        yellow_min = self.config.thresholds.yellow.min_composite
+        green_min = self._profile.green
+        yellow_min = self._profile.yellow
 
         if composite < green_min:
             tier = GateTier.YELLOW
