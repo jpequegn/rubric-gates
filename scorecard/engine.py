@@ -3,10 +3,14 @@
 Orchestrates all 5 dimension scorers, computes weighted composite score,
 and returns a complete ScoreResult. Main entry point for downstream
 consumers (hooks, CLI, dashboard).
+
+Supports both sync and async scoring. Async mode runs all dimension
+scorers concurrently with per-scorer timeouts.
 """
 
 from __future__ import annotations
 
+import asyncio
 import getpass
 from datetime import datetime
 from pathlib import Path
@@ -28,12 +32,22 @@ class RubricEngine:
     and produces a weighted composite ScoreResult.
     """
 
-    def __init__(self, config: RubricGatesConfig | None = None):
+    DEFAULT_SCORER_TIMEOUT = 30.0
+    DEFAULT_FILE_CONCURRENCY = 5
+
+    def __init__(
+        self,
+        config: RubricGatesConfig | None = None,
+        scorer_timeout: float = DEFAULT_SCORER_TIMEOUT,
+        file_concurrency: int = DEFAULT_FILE_CONCURRENCY,
+    ):
         if config is None:
             config = load_config()
         self.config = config
         self.scorecard_config = config.scorecard
         self._scorers = self._load_scorers()
+        self._scorer_timeout = scorer_timeout
+        self._file_semaphore = asyncio.Semaphore(file_concurrency)
 
     def _load_scorers(self) -> dict[Dimension, Any]:
         """Load enabled dimension scorers based on config."""
@@ -151,6 +165,124 @@ class RubricEngine:
         if total_weight == 0:
             return 0.0
         return min(max(weighted_sum / total_weight, 0.0), 1.0)
+
+    async def score_async(
+        self,
+        code: str,
+        filename: str = "",
+        *,
+        user: str = "",
+        skill_used: str = "",
+        project_files: list[str] | None = None,
+        test_code: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ScoreResult:
+        """Run all enabled dimension scorers concurrently.
+
+        Each scorer has a per-scorer timeout. On timeout or error,
+        the dimension gets a zero score instead of blocking the pipeline.
+        """
+        if not user:
+            try:
+                user = getpass.getuser()
+            except Exception:
+                user = "unknown"
+
+        async def _run_scorer(
+            dimension: Dimension,
+            scorer: Any,
+        ) -> tuple[Dimension, DimensionScore | Exception]:
+            try:
+                if dimension == Dimension.TESTABILITY:
+                    coro = scorer.score_async(
+                        code, filename, project_files=project_files, test_code=test_code
+                    )
+                else:
+                    coro = scorer.score_async(code, filename)
+                result = await asyncio.wait_for(coro, timeout=self._scorer_timeout)
+                return dimension, result
+            except asyncio.TimeoutError:
+                return dimension, TimeoutError(f"{dimension.value} timed out")
+            except Exception as e:
+                return dimension, e
+
+        tasks = [_run_scorer(dim, scorer) for dim, scorer in self._scorers.items()]
+        results = await asyncio.gather(*tasks)
+
+        dimension_scores: list[DimensionScore] = []
+        scorer_errors: list[str] = []
+
+        for dimension, result in results:
+            if isinstance(result, DimensionScore):
+                dimension_scores.append(result)
+            else:
+                error_msg = f"{dimension.value}: {result}"
+                scorer_errors.append(error_msg)
+                dimension_scores.append(
+                    DimensionScore(
+                        dimension=dimension,
+                        score=0.0,
+                        method=ScoringMethod.RULE_BASED,
+                        details=f"Scorer error: {result}",
+                    )
+                )
+
+        composite = self._compute_composite(dimension_scores)
+
+        result_metadata = metadata.copy() if metadata else {}
+        if scorer_errors:
+            result_metadata["scorer_errors"] = scorer_errors
+
+        return ScoreResult(
+            timestamp=datetime.now(),
+            user=user,
+            skill_used=skill_used,
+            files_touched=[filename] if filename else [],
+            dimension_scores=dimension_scores,
+            composite_score=composite,
+            source_code=code if code else None,
+            metadata=result_metadata,
+        )
+
+    async def score_file_async(
+        self,
+        file_path: str | Path,
+        *,
+        user: str = "",
+        skill_used: str = "",
+        project_files: list[str] | None = None,
+    ) -> ScoreResult:
+        """Async version of score_file."""
+        path = Path(file_path)
+        code = await asyncio.to_thread(path.read_text)
+        return await self.score_async(
+            code,
+            filename=path.name,
+            user=user,
+            skill_used=skill_used,
+            project_files=project_files,
+        )
+
+    async def score_files_async(
+        self,
+        file_paths: list[str | Path],
+        *,
+        user: str = "",
+        skill_used: str = "",
+    ) -> list[ScoreResult]:
+        """Score multiple files concurrently with semaphore limit."""
+        str_paths = [str(p) for p in file_paths]
+
+        async def _score_one(fp: str | Path) -> ScoreResult:
+            async with self._file_semaphore:
+                return await self.score_file_async(
+                    fp,
+                    user=user,
+                    skill_used=skill_used,
+                    project_files=str_paths,
+                )
+
+        return list(await asyncio.gather(*[_score_one(fp) for fp in file_paths]))
 
     def score_file(
         self,

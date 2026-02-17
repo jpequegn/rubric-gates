@@ -355,6 +355,33 @@ def _call_llm_judge(code: str, model: str = "claude-sonnet-4-5-20250514") -> dic
         return None
 
 
+async def _call_llm_judge_async(
+    code: str, model: str = "claude-sonnet-4-5-20250514"
+) -> dict | None:
+    """Async version of the LLM judge call using AsyncAnthropic."""
+    try:
+        import anthropic
+    except ImportError:
+        return None
+
+    try:
+        client = anthropic.AsyncAnthropic()
+        response = await client.messages.create(
+            model=model,
+            max_tokens=512,
+            messages=[
+                {"role": "user", "content": _LLM_JUDGE_PROMPT.format(code=code[:4000])},
+            ],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def _clamp(value: float) -> float:
     try:
         return min(max(float(value), 0.0), 1.0)
@@ -398,6 +425,82 @@ class TestabilityScorer:
     def __init__(self, use_llm: bool = True, model: str = "claude-sonnet-4-5-20250514"):
         self.use_llm = use_llm
         self.model = model
+
+    async def score_async(
+        self,
+        code: str,
+        filename: str = "",
+        project_files: list[str] | None = None,
+        test_code: str | None = None,
+    ) -> DimensionScore:
+        """Async version — native async for LLM, thread pool for rule-based."""
+        if not code or not code.strip():
+            return DimensionScore(
+                dimension=Dimension.TESTABILITY,
+                score=0.0,
+                method=ScoringMethod.RULE_BASED,
+                details="Empty code",
+            )
+
+        key = _cache_key(code, filename, project_files)
+        if key in _score_cache:
+            return _score_cache[key]
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            result = DimensionScore(
+                dimension=Dimension.TESTABILITY,
+                score=0.0,
+                method=ScoringMethod.RULE_BASED,
+                details="SyntaxError — cannot analyze testability",
+            )
+            _score_cache[key] = result
+            return result
+
+        report = TestabilityReport()
+        report.checks.append(check_test_file_exists(filename, project_files))
+        report.checks.append(check_test_assertions(test_code))
+        report.checks.append(check_function_purity(tree))
+        report.checks.append(check_modularity(tree))
+
+        rule_score = report.total_score
+        rule_details = report.details_text
+
+        if self.use_llm:
+            llm_result = await _call_llm_judge_async(code, model=self.model)
+            if llm_result is not None:
+                llm_score = sum(_clamp(llm_result.get(k, 0.5)) * w for k, w in _LLM_WEIGHTS.items())
+                llm_score = min(max(llm_score, 0.0), 1.0)
+                reasoning = llm_result.get("reasoning", "")
+
+                combined = rule_score * 0.5 + llm_score * 0.5
+                details = f"{rule_details}; [LLM] {reasoning}"
+
+                result = DimensionScore(
+                    dimension=Dimension.TESTABILITY,
+                    score=combined,
+                    method=ScoringMethod.HYBRID,
+                    details=details,
+                    metadata={
+                        "rule_score": rule_score,
+                        "llm_score": llm_score,
+                        "isolation": _clamp(llm_result.get("isolation", 0.5)),
+                        "mockability": _clamp(llm_result.get("mockability", 0.5)),
+                        "edge_cases": _clamp(llm_result.get("edge_cases", 0.5)),
+                    },
+                )
+                _score_cache[key] = result
+                return result
+
+        result = DimensionScore(
+            dimension=Dimension.TESTABILITY,
+            score=rule_score,
+            method=ScoringMethod.RULE_BASED,
+            details=f"(rule-based only) {rule_details}",
+        )
+        _score_cache[key] = result
+        return result
 
     def score(
         self,
