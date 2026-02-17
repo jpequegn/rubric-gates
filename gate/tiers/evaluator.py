@@ -23,7 +23,7 @@ from __future__ import annotations
 from shared.config import GateConfig, load_config
 from shared.models import Dimension, GateResult, GateTier, PatternFinding, ScoreResult
 
-from gate.patterns import get_all_detectors
+from gate.patterns import get_configured_detectors
 
 
 # Default per-dimension yellow thresholds
@@ -54,7 +54,7 @@ class TierEvaluator:
             config = load_config().gate
         self.config = config
         self.dim_yellow = dimension_yellow_thresholds or _DEFAULT_DIM_YELLOW
-        self.detectors = get_all_detectors()
+        self.detectors = get_configured_detectors(config.patterns)
 
     def evaluate(
         self,

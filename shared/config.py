@@ -60,6 +60,23 @@ class OverridesConfig(BaseModel):
     max_overrides_per_user_per_week: int = 3
 
 
+class PatternRuleConfig(BaseModel):
+    """A single custom pattern detection rule."""
+
+    name: str
+    pattern: str
+    severity: str = "medium"  # critical, high, medium, low
+    message: str = ""
+    remediation: str = ""
+
+
+class PatternsConfig(BaseModel):
+    """Configuration for pattern detection rules."""
+
+    custom: list[PatternRuleConfig] = Field(default_factory=list)
+    disabled: list[str] = Field(default_factory=list)
+
+
 class GateConfig(BaseModel):
     """Configuration for the gate project."""
 
@@ -72,6 +89,7 @@ class GateConfig(BaseModel):
             "unvetted_dependencies",
         ]
     )
+    patterns: PatternsConfig = Field(default_factory=PatternsConfig)
     overrides: OverridesConfig = Field(default_factory=OverridesConfig)
 
 
