@@ -401,6 +401,12 @@ class MaintainabilityScorer:
         self.file_length_threshold = file_length_threshold
         self.nesting_depth_threshold = nesting_depth_threshold
 
+    async def score_async(self, code: str, filename: str = "") -> DimensionScore:
+        """Async version — runs CPU-bound analysis in thread pool."""
+        import asyncio
+
+        return await asyncio.to_thread(self.score, code, filename)
+
     def score(self, code: str, filename: str = "") -> DimensionScore:
         """Score code maintainability. Returns 0.0-1.0."""
         if not code or not code.strip():

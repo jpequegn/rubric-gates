@@ -106,6 +106,41 @@ def _call_llm_judge(code: str, model: str = "claude-sonnet-4-5-20250514") -> LLM
         return None
 
 
+async def _call_llm_judge_async(
+    code: str, model: str = "claude-sonnet-4-5-20250514"
+) -> LLMJudgeResult | None:
+    """Async version of the LLM judge call using AsyncAnthropic."""
+    try:
+        import anthropic
+    except ImportError:
+        return None
+
+    try:
+        client = anthropic.AsyncAnthropic()
+        response = await client.messages.create(
+            model=model,
+            max_tokens=512,
+            messages=[
+                {"role": "user", "content": _LLM_JUDGE_PROMPT.format(code=code[:4000])},
+            ],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+
+        data = json.loads(text)
+        return LLMJudgeResult(
+            logic_explanation=_clamp(data.get("logic_explanation", 0.5)),
+            function_docs=_clamp(data.get("function_docs", 0.5)),
+            purpose_docs=_clamp(data.get("purpose_docs", 0.5)),
+            comment_accuracy=_clamp(data.get("comment_accuracy", 0.5)),
+            reasoning=data.get("reasoning", ""),
+        )
+    except Exception:
+        return None
+
+
 def _clamp(value: float) -> float:
     """Clamp a value to 0.0-1.0."""
     try:
@@ -332,6 +367,62 @@ class DocumentationScorer:
     def __init__(self, use_llm: bool = True, model: str = "claude-sonnet-4-5-20250514"):
         self.use_llm = use_llm
         self.model = model
+
+    async def score_async(self, code: str, filename: str = "") -> DimensionScore:
+        """Async version — native async for LLM, thread pool for fallback."""
+        import asyncio
+
+        if not code or not code.strip():
+            return DimensionScore(
+                dimension=Dimension.DOCUMENTATION,
+                score=0.0,
+                method=ScoringMethod.LLM_JUDGE,
+                details="Empty code",
+            )
+
+        key = _cache_key(code)
+        if key in _score_cache:
+            return _score_cache[key]
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            result = DimensionScore(
+                dimension=Dimension.DOCUMENTATION,
+                score=0.0,
+                method=ScoringMethod.RULE_BASED,
+                details="SyntaxError — cannot analyze documentation",
+            )
+            _score_cache[key] = result
+            return result
+
+        if self.use_llm:
+            llm_result = await _call_llm_judge_async(code, model=self.model)
+            if llm_result is not None:
+                result = DimensionScore(
+                    dimension=Dimension.DOCUMENTATION,
+                    score=llm_result.weighted_score,
+                    method=ScoringMethod.LLM_JUDGE,
+                    details=llm_result.reasoning,
+                    metadata={
+                        "logic_explanation": llm_result.logic_explanation,
+                        "function_docs": llm_result.function_docs,
+                        "purpose_docs": llm_result.purpose_docs,
+                        "comment_accuracy": llm_result.comment_accuracy,
+                    },
+                )
+                _score_cache[key] = result
+                return result
+
+        fallback_score, fallback_details = await asyncio.to_thread(_score_fallback, code, tree)
+        result = DimensionScore(
+            dimension=Dimension.DOCUMENTATION,
+            score=fallback_score,
+            method=ScoringMethod.RULE_BASED,
+            details=f"(fallback) {fallback_details}",
+        )
+        _score_cache[key] = result
+        return result
 
     def score(self, code: str, filename: str = "") -> DimensionScore:
         """Score documentation quality. Returns 0.0-1.0."""
