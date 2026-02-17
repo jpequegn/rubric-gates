@@ -40,11 +40,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_score.add_argument("--skill", default="", help="Skill used to generate the code")
     sp_score.add_argument("--store", action="store_true", help="Store result in JSONL backend")
     sp_score.add_argument("--tool", default="", help="Tool slug to update in registry")
+    sp_score.add_argument(
+        "--profile", default="", help="Threshold profile name (e.g., strict, relaxed)"
+    )
 
     # --- check ---
     sp_check = subparsers.add_parser("check", help="Quick gate check (score + tier, no storage)")
     sp_check.add_argument("file", help="Python file to check")
     sp_check.add_argument("--user", default="", help="User who generated the code")
+    sp_check.add_argument(
+        "--profile", default="", help="Threshold profile name (e.g., strict, relaxed)"
+    )
 
     # --- status ---
     sp_status = subparsers.add_parser("status", help="Show tool registry status")
@@ -129,7 +135,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     )
 
     # Gate
-    evaluator = TierEvaluator(config=config.gate)
+    evaluator = TierEvaluator(config=config.gate, profile=args.profile)
     gate_result = evaluator.evaluate(score_result, code, filename)
 
     # Output
@@ -167,7 +173,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     engine = RubricEngine(config=config)
     score_result = engine.score(code, filename, user=args.user)
 
-    evaluator = TierEvaluator(config=config.gate)
+    evaluator = TierEvaluator(config=config.gate, profile=args.profile)
     gate_result = evaluator.evaluate(score_result, code, filename)
 
     print(f"Score: {score_result.composite_score:.2f}")

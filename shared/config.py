@@ -54,6 +54,28 @@ class GateThresholds(BaseModel):
     red: RedThreshold = Field(default_factory=RedThreshold)
 
 
+class DimensionThresholdOverride(BaseModel):
+    """Per-dimension threshold overrides within a profile."""
+
+    green: float | None = None
+    yellow: float | None = None
+    red: float | None = None
+
+
+class ThresholdProfile(BaseModel):
+    """Named threshold profile for gate evaluation.
+
+    Composite thresholds control the overall green/yellow/red classification.
+    Per-dimension overrides allow stricter or more relaxed thresholds
+    for specific dimensions (e.g., security always strict).
+    """
+
+    green: float = 0.7
+    yellow: float = 0.5
+    red_security: float = 0.3
+    dimensions: dict[str, DimensionThresholdOverride] = Field(default_factory=dict)
+
+
 class OverridesConfig(BaseModel):
     require_justification: bool = True
     notify_tech_team: bool = True
@@ -90,7 +112,43 @@ class GateConfig(BaseModel):
         ]
     )
     patterns: PatternsConfig = Field(default_factory=PatternsConfig)
+    profiles: dict[str, ThresholdProfile] = Field(default_factory=dict)
+    active_profile: str = ""
     overrides: OverridesConfig = Field(default_factory=OverridesConfig)
+
+    def get_profile(self, name: str = "") -> ThresholdProfile:
+        """Resolve a threshold profile by name.
+
+        Profile inheritance: custom profiles extend the default profile.
+        Any fields not set in the custom profile fall back to defaults.
+
+        Args:
+            name: Profile name. Empty string or "default" returns defaults.
+
+        Returns:
+            Resolved ThresholdProfile.
+
+        Raises:
+            ValueError: If the named profile does not exist.
+        """
+        default = ThresholdProfile(
+            green=self.thresholds.green.min_composite,
+            yellow=self.thresholds.yellow.min_composite,
+            red_security=self.thresholds.red.security,
+        )
+
+        profile_name = name or self.active_profile
+        if not profile_name or profile_name == "default":
+            return default
+
+        if profile_name not in self.profiles:
+            raise ValueError(
+                f"Unknown profile '{profile_name}'. "
+                f"Available: {', '.join(sorted(self.profiles.keys()))} (and 'default')"
+            )
+
+        profile = self.profiles[profile_name]
+        return profile
 
 
 class T0ToT1Triggers(BaseModel):
