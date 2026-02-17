@@ -16,10 +16,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from shared.config import RegistryConfig, load_config
-from shared.models import ScoreResult, ToolRegistryEntry, ToolTier
+from shared.models import DemotionSuggestion, ScoreResult, ToolRegistryEntry, ToolTier
 from shared.storage import StorageBackend
 
 from registry.catalog.catalog import ToolCatalog
+from registry.graduation.regression import RegressionDetector
 from registry.graduation.rubrics import GraduationResult, GraduationRubric
 
 
@@ -57,6 +58,7 @@ class GraduationTriggerEngine:
         self._config = config
         self._triggers = config.auto_triggers
         self._rubric = GraduationRubric()
+        self._regression = RegressionDetector(config.regression)
 
     def check_triggers(self) -> list[GraduationSuggestion]:
         """Scan all tools for graduation triggers.
@@ -189,6 +191,35 @@ class GraduationTriggerEngine:
             )
 
         return None
+
+    def check_regressions(self) -> list[DemotionSuggestion]:
+        """Scan all tools for quality regressions.
+
+        Returns:
+            List of demotion suggestions for tools with sustained quality drops.
+        """
+        suggestions: list[DemotionSuggestion] = []
+        tools = self._catalog.list()
+
+        for tool in tools:
+            suggestion = self.check_tool_regression(tool.slug)
+            if suggestion is not None:
+                suggestions.append(suggestion)
+
+        return suggestions
+
+    def check_tool_regression(self, slug: str) -> DemotionSuggestion | None:
+        """Check a specific tool for quality regression.
+
+        Returns:
+            A DemotionSuggestion if regression detected, None otherwise.
+        """
+        tool = self._catalog.get(slug)
+        if tool is None:
+            return None
+
+        scores = self._get_tool_scores(tool)
+        return self._regression.check(tool, scores)
 
     def _get_tool_scores(self, tool: ToolRegistryEntry) -> list[ScoreResult]:
         """Get all scores for a tool from storage."""
