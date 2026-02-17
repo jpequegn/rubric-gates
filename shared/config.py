@@ -171,10 +171,20 @@ class AutoTriggers(BaseModel):
     t2_to_t3: T2ToT3Triggers = Field(default_factory=T2ToT3Triggers)
 
 
+class RegressionConfig(BaseModel):
+    """Configuration for regression detection."""
+
+    consecutive_scores: int = 10
+    red_tier_threshold: int = 5
+    rolling_window: int = 20
+    grace_period_days: int = 7
+
+
 class RegistryConfig(BaseModel):
     """Configuration for the registry project."""
 
     auto_triggers: AutoTriggers = Field(default_factory=AutoTriggers)
+    regression: RegressionConfig = Field(default_factory=RegressionConfig)
 
 
 class StorageConfig(BaseModel):

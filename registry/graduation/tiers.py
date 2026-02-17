@@ -68,10 +68,30 @@ VALID_TRANSITIONS: list[tuple[ToolTier, ToolTier]] = [
     (ToolTier.T2, ToolTier.T3),
 ]
 
+# Valid demotion transitions (one step down)
+VALID_DEMOTIONS: list[tuple[ToolTier, ToolTier]] = [
+    (ToolTier.T3, ToolTier.T2),
+    (ToolTier.T2, ToolTier.T1),
+    (ToolTier.T1, ToolTier.T0),
+]
+
 
 def is_valid_transition(from_tier: ToolTier, to_tier: ToolTier) -> bool:
     """Check if a tier transition is valid (must be one step up)."""
     return (from_tier, to_tier) in VALID_TRANSITIONS
+
+
+def is_valid_demotion(from_tier: ToolTier, to_tier: ToolTier) -> bool:
+    """Check if a tier demotion is valid (must be one step down)."""
+    return (from_tier, to_tier) in VALID_DEMOTIONS
+
+
+def demotion_target(tier: ToolTier) -> ToolTier | None:
+    """Get the demotion target for a tier, or None if at T0."""
+    for from_t, to_t in VALID_DEMOTIONS:
+        if from_t == tier:
+            return to_t
+    return None
 
 
 def get_tier_definition(tier: ToolTier) -> TierDefinition:

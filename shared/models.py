@@ -119,13 +119,23 @@ class OverrideRecord(BaseModel):
 
 
 class GraduationEvent(BaseModel):
-    """Record of a tool's tier promotion."""
+    """Record of a tool's tier promotion or demotion."""
 
     from_tier: ToolTier
     to_tier: ToolTier
     date: datetime = Field(default_factory=datetime.now)
     reason: str = ""
     approved_by: str = ""
+
+
+class DemotionSuggestion(BaseModel):
+    """A suggestion to demote a tool to a lower tier due to regression."""
+
+    tool_slug: str
+    current_tier: ToolTier
+    suggested_tier: ToolTier
+    reason: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScorecardSummary(BaseModel):
