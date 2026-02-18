@@ -1,5 +1,7 @@
 # rubric-gates
 
+[![CI](https://github.com/jpequegn/rubric-gates/actions/workflows/ci.yml/badge.svg)](https://github.com/jpequegn/rubric-gates/actions/workflows/ci.yml)
+
 Rubric-based quality gates for AI-generated code. Built for IT teams managing Claude Code skill ecosystems that need quality control without blocking productivity.
 
 ## Projects
@@ -16,6 +18,13 @@ Tiered intervention system (green/yellow/red) that catches high-risk patterns �
 
 Lifecycle management for AI-generated tools. Automatic detection of when personal tools become shared/critical, with rubric-driven graduation from T0 (personal) to T3 (production critical).
 
+### Project 4: Rubric-Trained Models (`training/`)
+
+Closes the RLVR loop — uses rubric scores as reward signals to train models. Three phases:
+- **4A: Scorer Distillation** — Train a fast local model to predict rubric scores, replacing expensive LLM-judge API calls
+- **4B: Code Generation** — Fine-tune a code model with GRPO so it generates code that inherently passes your quality gates
+- **4C: Skill Prompt Optimization** — Use rubric rewards to automatically optimize Claude Code skill prompts
+
 ## Architecture
 
 ```
@@ -25,6 +34,7 @@ Lifecycle management for AI-generated tools. Automatic detection of when persona
     → [Gate evaluates tier (P2)]
     → [Registry tracks lifecycle (P3)]
     → [Dashboard surfaces insights]
+    → [Scores feed back as training rewards (P4)]
 ```
 
 ## Design Principles
@@ -63,6 +73,10 @@ rubric-gates/
 │   ├── catalog/        # Tool catalog storage
 │   ├── graduation/     # Graduation rubrics & triggers
 │   └── workflows/      # Graduation workflow engine
+├── training/           # P4: Rubric-trained models
+│   ├── distillation.py # Phase A: Scorer distillation
+│   ├── code_gen.py     # Phase B: GRPO code generation
+│   └── skill_optimizer.py # Phase C: Skill prompt optimization
 ├── shared/             # Shared utilities
 │   ├── config.py       # Configuration management
 │   └── models.py       # Common data models
